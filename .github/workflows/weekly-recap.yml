@@ -1,28 +1,25 @@
 name: Weekly AI News Recap
+
 on:
-schedule:
-- cron: '0 12 * * 1'
-workflow_dispatch:
+  schedule:
+    - cron: '0 12 * * 1'
+  workflow_dispatch:
+
 jobs:
-send-recap:
-runs-on: ubuntu-latest
-steps:
-- name: Checkout code
-uses: actions/checkout@v4
-- name: Set up Python
-uses: actions/setup-python@v5
-with:
-python-version: '3.11'
-cache: 'pip'
-- name: Install dependencies
-run: pip install -r requirements.txt
-- name: Run AI News Recap
-run: python main.py
-env:
-ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-SMTP_HOST: smtp.gmail.com
-SMTP_PORT: 587
-SMTP_USER: ${{ secrets.SMTP_USER }}
-SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-EMAIL_TO: ${{ secrets.EMAIL_TO }}
-EMAIL_FROM: ${{ secrets.SMTP_USER }}
+  send-recap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python main.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: '587'
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM: ${{ secrets.SMTP_USER }}
