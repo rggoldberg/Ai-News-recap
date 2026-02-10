@@ -1,7 +1,7 @@
 """
 Weekly AI News Recap -- Monday Morning Email
 =============================================
-Automated pipeline: RSS feeds -> Claude API -> email digest.
+Automated pipeline: RSS feeds + AI Twitter -> Claude API -> email digest.
 Runs via GitHub Actions every Monday at 7am EST.
 
 Built by Ryan using AI-assisted development (Claude).
@@ -84,6 +84,166 @@ RSS_FEEDS = [
 ]
 
 
+# -- AI Twitter / X Tracking ---------------------------------------------------
+# Key AI accounts whose posts often signal where things are heading.
+# We use multiple RSS bridge services as fallbacks since they go up and down.
+
+AI_TWITTER_ACCOUNTS = [
+    # Lab leaders and researchers
+    {"handle": "sama", "name": "Sam Altman (OpenAI)"},
+    {"handle": "demaborya", "name": "Dario Amodei (Anthropic)"},
+    {"handle": "ylecun", "name": "Yann LeCun (Meta)"},
+    {"handle": "kaborya", "name": "Karina Nguyen (Anthropic)"},
+    {"handle": "DrJimFan", "name": "Jim Fan (NVIDIA)"},
+    {"handle": "svpino", "name": "Santiago (ML eng)"},
+    {"handle": "swyx", "name": "swyx (AI eng)"},
+    {"handle": "emaborya", "name": "Emad Mostaque"},
+    # Dev tools / vibe coding voices
+    {"handle": "mcaborya", "name": "Amanda Askell (Anthropic)"},
+    {"handle": "karpathy", "name": "Andrej Karpathy"},
+    {"handle": "alexaborya", "name": "Alex Albert (Anthropic)"},
+    # AI commentary
+    {"handle": "EthanMollick", "name": "Ethan Mollick"},
+    {"handle": "emollick", "name": "Ethan Mollick (alt)"},
+    {"handle": "bindureddy", "name": "Bindu Reddy (Abacus.AI)"},
+]
+
+# Nitter/RSS bridge instances to try (these rotate availability)
+TWITTER_RSS_BRIDGES = [
+    "https://nitter.privacydev.net/{handle}/rss",
+    "https://nitter.poast.org/{handle}/rss",
+    "https://nitter.woodland.cafe/{handle}/rss",
+    "https://twiiit.com/{handle}/rss",
+]
+
+
+def fetch_twitter_discourse(lookback_days=LOOKBACK_DAYS):
+    """
+    Fetch recent posts from key AI Twitter accounts via RSS bridges.
+    Falls back through multiple bridge services since they are unreliable.
+    Returns a list of tweet-like items for Claude to analyze.
+    """
+    cutoff = datetime.now() - timedelta(days=lookback_days)
+    tweets = []
+    successful_bridge = None
+
+    for account in AI_TWITTER_ACCOUNTS:
+        fetched = False
+
+        # Try each bridge service
+        bridges_to_try = TWITTER_RSS_BRIDGES
+        # If we found a working bridge, try it first
+        if successful_bridge:
+            bridges_to_try = [successful_bridge] + [b for b in TWITTER_RSS_BRIDGES if b != successful_bridge]
+
+        for bridge_template in bridges_to_try:
+            if fetched:
+                break
+            try:
+                url = bridge_template.format(handle=account["handle"])
+                feed = feedparser.parse(url)
+
+                if not feed.entries:
+                    continue
+
+                successful_bridge = bridge_template
+
+                for entry in feed.entries[:5]:  # Max 5 posts per account
+                    published = None
+                    for date_field in ["published_parsed", "updated_parsed"]:
+                        if hasattr(entry, date_field) and getattr(entry, date_field):
+                            published = datetime(*getattr(entry, date_field)[:6])
+                            break
+
+                    if published and published < cutoff:
+                        continue
+
+                    text = entry.get("title", entry.get("summary", ""))
+                    text = re.sub(r"<[^>]+>", "", text)[:500]
+
+                    # Skip retweets and very short posts
+                    if text.startswith("RT @") or len(text) < 30:
+                        continue
+
+                    tweets.append({
+                        "author": account["name"],
+                        "handle": "@" + account["handle"],
+                        "text": text,
+                        "url": entry.get("link", ""),
+                        "published": published.isoformat() if published else None,
+                    })
+                fetched = True
+
+            except Exception:
+                continue
+
+        if not fetched:
+            # Silent fail per account -- bridges are flaky
+            pass
+
+    print(f"Fetched {len(tweets)} tweets from AI Twitter accounts")
+    return tweets
+
+
+def fetch_twitter_via_search_feeds():
+    """
+    Alternative: use HN/Reddit RSS for Twitter-adjacent AI discourse.
+    These capture the most viral AI tweets that get reshared.
+    Always works regardless of Nitter status.
+    """
+    search_feeds = [
+        {
+            "name": "Reddit r/LocalLLaMA Hot",
+            "url": "https://www.reddit.com/r/LocalLLaMA/hot/.rss?limit=10",
+        },
+        {
+            "name": "Reddit r/MachineLearning Hot",
+            "url": "https://www.reddit.com/r/MachineLearning/hot/.rss?limit=10",
+        },
+        {
+            "name": "Reddit r/artificial Hot",
+            "url": "https://www.reddit.com/r/artificial/hot/.rss?limit=10",
+        },
+        {
+            "name": "HN AI Discussions",
+            "url": "https://hnrss.org/best?q=GPT+OR+Claude+OR+Gemini+OR+Llama+OR+AGI&comments=50",
+        },
+    ]
+
+    discourse_items = []
+    cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+
+    for feed_info in search_feeds:
+        try:
+            feed = feedparser.parse(feed_info["url"])
+            for entry in feed.entries[:8]:
+                published = None
+                for date_field in ["published_parsed", "updated_parsed"]:
+                    if hasattr(entry, date_field) and getattr(entry, date_field):
+                        published = datetime(*getattr(entry, date_field)[:6])
+                        break
+
+                if published and published < cutoff:
+                    continue
+
+                title = entry.get("title", "")
+                text = entry.get("summary", entry.get("description", ""))
+                text = re.sub(r"<[^>]+>", "", text)[:400]
+
+                discourse_items.append({
+                    "source": feed_info["name"],
+                    "title": title,
+                    "text": text,
+                    "url": entry.get("link", ""),
+                    "published": published.isoformat() if published else None,
+                })
+        except Exception as e:
+            print(f"WARNING: Failed to fetch {feed_info['name']}: {e}")
+
+    print(f"Fetched {len(discourse_items)} items from AI community discourse")
+    return discourse_items
+
+
 # -- Image Extraction ----------------------------------------------------------
 
 def extract_image_from_entry(entry):
@@ -110,7 +270,9 @@ def extract_image_from_entry(entry):
             return enc.get("href", enc.get("url", ""))
 
     # Strategy 3: first <img> tag in the summary/content HTML
-    content_html = entry.get("summary", entry.get("content", [{}])[0].get("value", "") if entry.get("content") else "")
+    content_html = entry.get("summary", "")
+    if not content_html and entry.get("content"):
+        content_html = entry.get("content", [{}])[0].get("value", "")
     if content_html:
         img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_html)
         if img_match:
@@ -145,7 +307,7 @@ def fetch_og_image(article_url):
         if og_match:
             return og_match.group(1)
 
-        # Try reverse attribute order (some sites put content before property)
+        # Try reverse attribute order
         og_match_rev = re.search(
             r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
             head_html,
@@ -164,7 +326,6 @@ def validate_image_url(url):
     """Quick check that an image URL is likely valid and not a tracker pixel."""
     if not url or not url.startswith("http"):
         return ""
-    # Skip common tracker/pixel patterns
     skip_patterns = ["1x1", "pixel", "tracking", "spacer", "blank", "feedburner"]
     url_lower = url.lower()
     for pattern in skip_patterns:
@@ -345,18 +506,20 @@ SYSTEM_PROMPT = (
     "'poised to', 'game-changer', 'paradigm shift', 'ecosystem', 'synergy', 'leverage', "
     "'double-edged sword', 'raises important questions'. These are AI writing tells.\n"
     "- Do NOT start paragraphs with 'This week'. Vary your openings.\n"
-    "- Contractions are good. Sentence fragments are fine. Be human.\n\n"
+    "- Contractions are good. Sentence fragments are fine. Be human.\n"
+    "- NEVER use em-dashes (the long dash character). Use commas, periods, semicolons, "
+    "parentheses, or just break into two sentences instead. This is a hard rule.\n\n"
 
     "DEPTH OF ANALYSIS:\n"
     "- For each story, go beyond 'X company did Y'. Explain the second-order effects.\n"
     "- Connect dots between stories when possible (e.g., 'This is the third agent framework "
-    "launch this month -- the market is clearly converging on...').\n"
+    "launch this month. The market is clearly converging on...').\n"
     "- Include specific numbers, benchmarks, model names, or technical details when available.\n"
     "- For Salesforce/AgentForce stories: be specific about what changed, which clouds/products "
     "are affected, and what it means for implementation teams.\n"
     "- For frontier model releases: mention what improved, by how much, and whether it actually "
     "matters in practice vs. just benchmarks.\n"
-    "- For dev tools: note what's actually usable now vs. what's just a demo.\n\n"
+    "- For dev tools: note what is actually usable now vs. what is just a demo.\n\n"
 
     "STRUCTURE:\n"
     "- Start with a 1-2 sentence cold open. No 'welcome to your weekly recap' preamble.\n"
@@ -366,9 +529,20 @@ SYSTEM_PROMPT = (
     "  2. Source name and domain in small text below the headline\n"
     "  3. An image if one is provided in the article data (use the image_url field). "
     "Display it at max 500px wide, rounded corners, above the summary.\n"
-    "  4. 2-4 sentence analysis (not just a summary -- your take on why it matters)\n"
+    "  4. 2-4 sentence analysis (not just a summary. Your take on why it matters)\n"
     "  5. A one-line 'So what:' callout in bold that connects it to Ryan's work "
-    "(Salesforce, consulting, dev tools, or general career relevance)\n"
+    "(Salesforce, consulting, dev tools, or general career relevance)\n\n"
+
+    "- After the main stories, include a 'Buzz on AI Twitter' section:\n"
+    "  - This section summarizes the hottest discourse from AI Twitter/X this week.\n"
+    "  - You will receive tweet data from key AI accounts and community discussions.\n"
+    "  - Identify 3-5 trending themes, debates, or viral takes from the data.\n"
+    "  - For each: summarize the take, who said it, and why it matters.\n"
+    "  - Link to the original tweet/post when available.\n"
+    "  - This section should feel like 'here is what AI Twitter was arguing about this week'\n"
+    "  - If the tweet data is empty or sparse, pull from the community discourse items instead "
+    "and note the most active discussions from Reddit/HN.\n\n"
+
     "- End with 'On My Radar' section: 2-3 things to watch next week, written as quick takes.\n\n"
 
     "HTML FORMAT:\n"
@@ -377,38 +551,58 @@ SYSTEM_PROMPT = (
     "- Font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif.\n"
     "- Headings in #1a1a1a, body text in #333, links in #2563eb.\n"
     "- Images: max-width 100%, border-radius 8px, margin-bottom 12px. "
-    "If no image_url is provided for a story, just skip the image -- do NOT use a placeholder.\n"
+    "If no image_url is provided for a story, just skip the image. Do NOT use a placeholder.\n"
     "- Article source line: font-size 13px, color #888.\n"
     "- 'So what' callout: background #f0f7ff, padding 8px 12px, border-left 3px solid #2563eb, "
     "font-size 14px, margin-top 8px.\n"
+    "- 'Buzz on AI Twitter' section: use a slightly different visual treatment. "
+    "Maybe a darker background (#f8f8f8) or a left border in orange (#f59e0b).\n"
     "- Clean spacing between stories. Subtle dividers (#eee) between sections.\n"
-    "- Mobile-friendly: everything should look good at 375px wide too."
+    "- Mobile-friendly: everything should look good at 375px wide too.\n"
+    "- IMPORTANT: Do not use any em-dash characters anywhere in the output HTML. "
+    "Use regular hyphens, commas, or semicolons instead."
 )
 
 USER_PROMPT_TEMPLATE = (
-    "Here are {count} AI news articles from the past week ({date_range}).\n\n"
+    "Here are {article_count} AI news articles from the past week ({date_range}).\n\n"
     "Each article includes: title, summary, url, source, category, published date, "
     "image_url (may be empty), and domain.\n\n"
-    "Analyze them and write my weekly AI news recap email. Remember: be specific, "
-    "have opinions, connect the dots, and include the article links and images.\n\n"
-    "ARTICLES:\n{articles_json}"
+    "ARTICLES:\n{articles_json}\n\n"
+    "---\n\n"
+    "Here is what was trending on AI Twitter/X this week ({tweet_count} posts from "
+    "key accounts):\n\n"
+    "TWEETS:\n{tweets_json}\n\n"
+    "---\n\n"
+    "And here are the hottest community discussions from Reddit and HN "
+    "({discourse_count} items):\n\n"
+    "COMMUNITY DISCOURSE:\n{discourse_json}\n\n"
+    "---\n\n"
+    "Now write my weekly AI news recap email. Remember: be specific, have opinions, "
+    "connect the dots, include the article links and images, cover what AI Twitter "
+    "was buzzing about, and NEVER use em-dash characters anywhere."
 )
 
 
-def generate_recap(articles):
-    """Send articles to Claude and get back a formatted email digest."""
+def generate_recap(articles, tweets, discourse):
+    """Send articles + tweets + discourse to Claude for a rich email digest."""
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    # Trim articles to avoid token limits
+    # Trim to avoid token limits
     articles = articles[:60]
+    tweets = tweets[:40]
+    discourse = discourse[:20]
 
     date_end = datetime.now().strftime("%B %d, %Y")
     date_start = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%B %d")
 
     user_prompt = USER_PROMPT_TEMPLATE.format(
-        count=len(articles),
+        article_count=len(articles),
         date_range=date_start + " - " + date_end,
         articles_json=json.dumps(articles, indent=2, default=str),
+        tweet_count=len(tweets),
+        tweets_json=json.dumps(tweets, indent=2, default=str),
+        discourse_count=len(discourse),
+        discourse_json=json.dumps(discourse, indent=2, default=str),
     )
 
     response = client.messages.create(
@@ -423,6 +617,11 @@ def generate_recap(articles):
     # Strip markdown code fences if Claude wraps the HTML
     html_content = re.sub(r"^```html?\s*\n?", "", html_content)
     html_content = re.sub(r"\n?```\s*$", "", html_content)
+
+    # Final safety pass: replace any em-dashes that slipped through
+    html_content = html_content.replace("\u2014", "--")  # em-dash
+    html_content = html_content.replace("\u2013", "-")   # en-dash
+    html_content = html_content.replace("\u2012", "-")   # figure dash
 
     print(f"Generated recap ({len(html_content)} chars)")
     return html_content
@@ -470,6 +669,7 @@ def main():
     print("=" * 60)
 
     # 1. Fetch from all sources
+    print("\n[1/6] Fetching RSS articles...")
     articles = fetch_rss_articles()
     articles += fetch_newsapi_articles()
 
@@ -478,24 +678,33 @@ def main():
         return
 
     # 2. Deduplicate
+    print("\n[2/6] Deduplicating...")
     articles = deduplicate(articles)
 
     # 3. Enrich with OG images where missing
+    print("\n[3/6] Enriching with images...")
     articles = enrich_with_og_images(articles)
 
-    # 4. Generate recap with Claude
-    html_recap = generate_recap(articles)
+    # 4. Fetch AI Twitter discourse
+    print("\n[4/6] Fetching AI Twitter discourse...")
+    tweets = fetch_twitter_discourse()
+    discourse = fetch_twitter_via_search_feeds()
 
-    # 5. Save locally (always)
+    # 5. Generate recap with Claude
+    print("\n[5/6] Generating recap with Claude...")
+    html_recap = generate_recap(articles, tweets, discourse)
+
+    # 6. Save locally (always)
     save_local(html_recap)
 
-    # 6. Send email (if configured)
+    # 7. Send email (if configured)
+    print("\n[6/6] Sending email...")
     if SMTP_USER and SMTP_PASSWORD and EMAIL_TO:
         send_email(html_recap)
     else:
-        print("Email not configured -- check .env file. Local copy saved.")
+        print("Email not configured. Check .env file. Local copy saved.")
 
-    print("Done!")
+    print("\nDone!")
 
 
 if __name__ == "__main__":
