@@ -116,70 +116,94 @@ TWITTER_RSS_BRIDGES = [
     "https://twiiit.com/{handle}/rss",
 ]
 
+# Strict timeout for bridge requests (seconds)
+BRIDGE_TIMEOUT = 4
+
+
+def _fetch_feed_with_timeout(url, timeout=BRIDGE_TIMEOUT):
+    """Fetch an RSS feed URL with a strict timeout using requests first."""
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AINewsBot/1.0)"},
+        )
+        if resp.status_code != 200:
+            return None
+        return feedparser.parse(resp.content)
+    except (requests.Timeout, requests.ConnectionError, requests.RequestException):
+        return None
+    except Exception:
+        return None
+
+
+def _probe_bridges():
+    """
+    Quick probe: find the first working Nitter bridge by testing one account.
+    Returns the working bridge template or None if all are dead.
+    """
+    test_handle = "karpathy"  # popular account, likely to have content
+    for bridge_template in TWITTER_RSS_BRIDGES:
+        url = bridge_template.format(handle=test_handle)
+        print(f"  Probing {bridge_template.split('//{')[0]}//...")
+        feed = _fetch_feed_with_timeout(url, timeout=3)
+        if feed and feed.entries:
+            print(f"  Found working bridge!")
+            return bridge_template
+    return None
+
 
 def fetch_twitter_discourse(lookback_days=LOOKBACK_DAYS):
     """
     Fetch recent posts from key AI Twitter accounts via RSS bridges.
-    Falls back through multiple bridge services since they are unreliable.
-    Returns a list of tweet-like items for Claude to analyze.
+    Probes for a working bridge first, then fetches all accounts through it.
+    If no bridge works, returns empty (the Reddit/HN fallback covers us).
     """
     cutoff = datetime.now() - timedelta(days=lookback_days)
     tweets = []
-    successful_bridge = None
 
+    # Step 1: Find a working bridge (fast fail if none work)
+    working_bridge = _probe_bridges()
+    if not working_bridge:
+        print("  No working Nitter bridge found. Skipping direct Twitter feeds.")
+        return tweets
+
+    # Step 2: Fetch all accounts through the working bridge
     for account in AI_TWITTER_ACCOUNTS:
-        fetched = False
+        try:
+            url = working_bridge.format(handle=account["handle"])
+            feed = _fetch_feed_with_timeout(url)
 
-        # Try each bridge service
-        bridges_to_try = TWITTER_RSS_BRIDGES
-        # If we found a working bridge, try it first
-        if successful_bridge:
-            bridges_to_try = [successful_bridge] + [b for b in TWITTER_RSS_BRIDGES if b != successful_bridge]
-
-        for bridge_template in bridges_to_try:
-            if fetched:
-                break
-            try:
-                url = bridge_template.format(handle=account["handle"])
-                feed = feedparser.parse(url)
-
-                if not feed.entries:
-                    continue
-
-                successful_bridge = bridge_template
-
-                for entry in feed.entries[:5]:  # Max 5 posts per account
-                    published = None
-                    for date_field in ["published_parsed", "updated_parsed"]:
-                        if hasattr(entry, date_field) and getattr(entry, date_field):
-                            published = datetime(*getattr(entry, date_field)[:6])
-                            break
-
-                    if published and published < cutoff:
-                        continue
-
-                    text = entry.get("title", entry.get("summary", ""))
-                    text = re.sub(r"<[^>]+>", "", text)[:500]
-
-                    # Skip retweets and very short posts
-                    if text.startswith("RT @") or len(text) < 30:
-                        continue
-
-                    tweets.append({
-                        "author": account["name"],
-                        "handle": "@" + account["handle"],
-                        "text": text,
-                        "url": entry.get("link", ""),
-                        "published": published.isoformat() if published else None,
-                    })
-                fetched = True
-
-            except Exception:
+            if not feed or not feed.entries:
                 continue
 
-        if not fetched:
-            # Silent fail per account -- bridges are flaky
-            pass
+            for entry in feed.entries[:5]:
+                published = None
+                for date_field in ["published_parsed", "updated_parsed"]:
+                    if hasattr(entry, date_field) and getattr(entry, date_field):
+                        published = datetime(*getattr(entry, date_field)[:6])
+                        break
+
+                if published and published < cutoff:
+                    continue
+
+                text = entry.get("title", entry.get("summary", ""))
+                text = re.sub(r"<[^>]+>", "", text)[:500]
+
+                # Skip retweets and very short posts
+                if text.startswith("RT @") or len(text) < 30:
+                    continue
+
+                tweets.append({
+                    "author": account["name"],
+                    "handle": "@" + account["handle"],
+                    "text": text,
+                    "url": entry.get("link", ""),
+                    "published": published.isoformat() if published else None,
+                })
+
+        except Exception:
+            continue
 
     print(f"Fetched {len(tweets)} tweets from AI Twitter accounts")
     return tweets
@@ -215,7 +239,9 @@ def fetch_twitter_via_search_feeds():
 
     for feed_info in search_feeds:
         try:
-            feed = feedparser.parse(feed_info["url"])
+            feed = _fetch_feed_with_timeout(feed_info["url"], timeout=5)
+            if not feed or not feed.entries:
+                continue
             for entry in feed.entries[:8]:
                 published = None
                 for date_field in ["published_parsed", "updated_parsed"]:
@@ -343,7 +369,10 @@ def fetch_rss_articles(lookback_days=LOOKBACK_DAYS):
 
     for feed_info in RSS_FEEDS:
         try:
-            feed = feedparser.parse(feed_info["url"])
+            feed = _fetch_feed_with_timeout(feed_info["url"], timeout=8)
+            if not feed:
+                print(f"WARNING: Timeout fetching {feed_info['name']}")
+                continue
             for entry in feed.entries:
                 published = None
                 for date_field in ["published_parsed", "updated_parsed"]:
