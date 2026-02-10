@@ -18,6 +18,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from urllib.parse import urlparse
 
 load_dotenv()
 
@@ -34,7 +35,7 @@ EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER)
 # How many days back to look for news
 LOOKBACK_DAYS = 7
 
-# -- News Sources (30+ feeds across 6 categories) -----------------------------
+# -- News Sources (28 feeds across 7 categories) ------------------------------
 
 RSS_FEEDS = [
 
@@ -83,6 +84,95 @@ RSS_FEEDS = [
 ]
 
 
+# -- Image Extraction ----------------------------------------------------------
+
+def extract_image_from_entry(entry):
+    """Try to pull an image URL from an RSS entry using multiple strategies."""
+
+    # Strategy 1: media:content or media:thumbnail (most RSS feeds)
+    media_content = entry.get("media_content", [])
+    if media_content:
+        for media in media_content:
+            url = media.get("url", "")
+            if url and any(url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]):
+                return url
+            if url and media.get("medium") == "image":
+                return url
+
+    media_thumb = entry.get("media_thumbnail", [])
+    if media_thumb:
+        return media_thumb[0].get("url", "")
+
+    # Strategy 2: enclosure (common in podcasts and some blogs)
+    enclosures = entry.get("enclosures", [])
+    for enc in enclosures:
+        if enc.get("type", "").startswith("image/"):
+            return enc.get("href", enc.get("url", ""))
+
+    # Strategy 3: first <img> tag in the summary/content HTML
+    content_html = entry.get("summary", entry.get("content", [{}])[0].get("value", "") if entry.get("content") else "")
+    if content_html:
+        img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_html)
+        if img_match:
+            img_url = img_match.group(1)
+            if img_url.startswith("http"):
+                return img_url
+
+    return ""
+
+
+def fetch_og_image(article_url):
+    """Fetch the Open Graph image from an article page as a fallback."""
+    try:
+        resp = requests.get(
+            article_url,
+            timeout=5,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AINewsBot/1.0)"},
+            allow_redirects=True,
+        )
+        if resp.status_code != 200:
+            return ""
+
+        # Only scan the first 20KB to keep it fast
+        head_html = resp.text[:20000]
+
+        # Look for og:image
+        og_match = re.search(
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            head_html,
+            re.IGNORECASE,
+        )
+        if og_match:
+            return og_match.group(1)
+
+        # Try reverse attribute order (some sites put content before property)
+        og_match_rev = re.search(
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+            head_html,
+            re.IGNORECASE,
+        )
+        if og_match_rev:
+            return og_match_rev.group(1)
+
+    except Exception:
+        pass
+
+    return ""
+
+
+def validate_image_url(url):
+    """Quick check that an image URL is likely valid and not a tracker pixel."""
+    if not url or not url.startswith("http"):
+        return ""
+    # Skip common tracker/pixel patterns
+    skip_patterns = ["1x1", "pixel", "tracking", "spacer", "blank", "feedburner"]
+    url_lower = url.lower()
+    for pattern in skip_patterns:
+        if pattern in url_lower:
+            return ""
+    return url
+
+
 # -- Fetch News ----------------------------------------------------------------
 
 def fetch_rss_articles(lookback_days=LOOKBACK_DAYS):
@@ -106,14 +196,26 @@ def fetch_rss_articles(lookback_days=LOOKBACK_DAYS):
                 title = entry.get("title", "")
                 summary = entry.get("summary", entry.get("description", ""))
                 summary = re.sub(r"<[^>]+>", "", summary)[:500]
+                link = entry.get("link", "")
+
+                # Extract image from RSS entry
+                image_url = validate_image_url(extract_image_from_entry(entry))
+
+                # Extract domain for display
+                domain = ""
+                if link:
+                    parsed = urlparse(link)
+                    domain = parsed.netloc.replace("www.", "")
 
                 articles.append({
                     "title": title,
                     "summary": summary,
-                    "url": entry.get("link", ""),
+                    "url": link,
                     "source": feed_info["name"],
                     "category": feed_info["category"],
                     "published": published.isoformat() if published else None,
+                    "image_url": image_url,
+                    "domain": domain,
                 })
         except Exception as e:
             print(f"WARNING: Failed to fetch {feed_info['name']}: {e}")
@@ -156,18 +258,48 @@ def fetch_newsapi_articles(lookback_days=LOOKBACK_DAYS):
             )
             data = resp.json()
             for a in data.get("articles", []):
+                url = a.get("url", "")
+                parsed = urlparse(url)
+                domain = parsed.netloc.replace("www.", "") if url else ""
                 articles.append({
                     "title": a.get("title", ""),
                     "summary": a.get("description", "")[:500],
-                    "url": a.get("url", ""),
+                    "url": url,
                     "source": a.get("source", {}).get("name", "NewsAPI"),
                     "category": "newsapi",
                     "published": a.get("publishedAt"),
+                    "image_url": validate_image_url(a.get("urlToImage", "")),
+                    "domain": domain,
                 })
         except Exception as e:
             print(f"WARNING: NewsAPI query failed: {e}")
 
     print(f"Fetched {len(articles)} articles from NewsAPI")
+    return articles
+
+
+# -- OG Image Enrichment -------------------------------------------------------
+
+def enrich_with_og_images(articles, max_fetches=15):
+    """
+    For articles missing images, try to fetch OG images from the article page.
+    Limited to max_fetches to keep runtime reasonable.
+    """
+    fetched = 0
+    for a in articles:
+        if a.get("image_url"):
+            continue
+        if fetched >= max_fetches:
+            break
+        if not a.get("url"):
+            continue
+
+        og_img = fetch_og_image(a["url"])
+        if og_img:
+            a["image_url"] = validate_image_url(og_img)
+            fetched += 1
+
+    print(f"Enriched {fetched} articles with OG images")
     return articles
 
 
@@ -197,30 +329,68 @@ def deduplicate(articles):
 # -- Claude Summarization ------------------------------------------------------
 
 SYSTEM_PROMPT = (
-    "You are an AI news analyst creating a weekly recap email for Ryan, "
-    "a senior consultant at Deloitte who works as a functional lead on Salesforce technologies "
-    "with a focus on AI (specifically AgentForce). He is also into AI dev tools (Cursor, Claude Code, "
-    "vibe coding), is a Claude Pro power user, and wants to stay sharp on frontier AI developments.\n\n"
-    "Your job: Read through this week's AI news articles and produce a structured, scannable "
-    "Monday morning email digest.\n\n"
-    "RULES:\n"
-    "- Be direct and opinionated. Do not just summarize -- tell Ryan what matters and why.\n"
-    "- If something is relevant to his Salesforce/AgentForce work, flag it explicitly.\n"
-    "- If something affects his consulting practice or Deloitte, call it out.\n"
-    "- If something relates to AI dev tools / vibe coding, flag it.\n"
-    "- Group by theme, not by source.\n"
-    "- Include 5-10 top stories max. Quality over quantity.\n"
-    "- For each story: 1-2 sentence summary + why it matters for Ryan + link.\n"
-    "- End with a What to Watch section with 2-3 things to keep an eye on next week.\n"
-    "- Keep the tone smart, casual, slightly witty. Not corporate newsletter energy.\n"
-    "- Output clean HTML email format with inline styles only (email-safe, no external CSS).\n"
-    "- Use a clean, modern email layout with good spacing and readability.\n"
-    "- Start with a brief 1-2 sentence TLDR of the week's biggest theme."
+    "You are writing a weekly AI news email for Ryan. He is a senior consultant at Deloitte, "
+    "functional lead on Salesforce (focused on AgentForce), and deeply into AI dev tools "
+    "(Cursor, Claude Code, vibe coding). He reads this every Monday morning with his coffee.\n\n"
+
+    "VOICE AND TONE:\n"
+    "- Write like a sharp friend who works in tech and actually reads this stuff, not like "
+    "a newsletter robot. Think casual group chat energy meets actual analysis.\n"
+    "- Vary your sentence structure. Mix short punchy takes with longer explanations. "
+    "Do NOT start every bullet with the same pattern.\n"
+    "- Have opinions. Say 'this matters because...' or 'honestly this is overhyped because...'\n"
+    "- Use specific details, numbers, and names. Vague summaries are useless.\n"
+    "- Do NOT use phrases like: 'in a move that', 'the landscape of', 'it remains to be seen', "
+    "'represents a significant', 'in an increasingly', 'the implications are', 'a testament to', "
+    "'poised to', 'game-changer', 'paradigm shift', 'ecosystem', 'synergy', 'leverage', "
+    "'double-edged sword', 'raises important questions'. These are AI writing tells.\n"
+    "- Do NOT start paragraphs with 'This week'. Vary your openings.\n"
+    "- Contractions are good. Sentence fragments are fine. Be human.\n\n"
+
+    "DEPTH OF ANALYSIS:\n"
+    "- For each story, go beyond 'X company did Y'. Explain the second-order effects.\n"
+    "- Connect dots between stories when possible (e.g., 'This is the third agent framework "
+    "launch this month -- the market is clearly converging on...').\n"
+    "- Include specific numbers, benchmarks, model names, or technical details when available.\n"
+    "- For Salesforce/AgentForce stories: be specific about what changed, which clouds/products "
+    "are affected, and what it means for implementation teams.\n"
+    "- For frontier model releases: mention what improved, by how much, and whether it actually "
+    "matters in practice vs. just benchmarks.\n"
+    "- For dev tools: note what's actually usable now vs. what's just a demo.\n\n"
+
+    "STRUCTURE:\n"
+    "- Start with a 1-2 sentence cold open. No 'welcome to your weekly recap' preamble.\n"
+    "- Group 5-10 top stories by theme, not by source.\n"
+    "- Each story MUST include:\n"
+    "  1. A bold headline that is the article title (linked to the article URL)\n"
+    "  2. Source name and domain in small text below the headline\n"
+    "  3. An image if one is provided in the article data (use the image_url field). "
+    "Display it at max 500px wide, rounded corners, above the summary.\n"
+    "  4. 2-4 sentence analysis (not just a summary -- your take on why it matters)\n"
+    "  5. A one-line 'So what:' callout in bold that connects it to Ryan's work "
+    "(Salesforce, consulting, dev tools, or general career relevance)\n"
+    "- End with 'On My Radar' section: 2-3 things to watch next week, written as quick takes.\n\n"
+
+    "HTML FORMAT:\n"
+    "- Output clean HTML with inline styles only (email-safe, no external CSS).\n"
+    "- Use a max-width of 600px, centered. Background #f5f5f5, content area white.\n"
+    "- Font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif.\n"
+    "- Headings in #1a1a1a, body text in #333, links in #2563eb.\n"
+    "- Images: max-width 100%, border-radius 8px, margin-bottom 12px. "
+    "If no image_url is provided for a story, just skip the image -- do NOT use a placeholder.\n"
+    "- Article source line: font-size 13px, color #888.\n"
+    "- 'So what' callout: background #f0f7ff, padding 8px 12px, border-left 3px solid #2563eb, "
+    "font-size 14px, margin-top 8px.\n"
+    "- Clean spacing between stories. Subtle dividers (#eee) between sections.\n"
+    "- Mobile-friendly: everything should look good at 375px wide too."
 )
 
 USER_PROMPT_TEMPLATE = (
     "Here are {count} AI news articles from the past week ({date_range}).\n\n"
-    "Please analyze them and create my weekly AI news recap email.\n\n"
+    "Each article includes: title, summary, url, source, category, published date, "
+    "image_url (may be empty), and domain.\n\n"
+    "Analyze them and write my weekly AI news recap email. Remember: be specific, "
+    "have opinions, connect the dots, and include the article links and images.\n\n"
     "ARTICLES:\n{articles_json}"
 )
 
@@ -243,12 +413,17 @@ def generate_recap(articles):
 
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=4096,
+        max_tokens=8192,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     )
 
     html_content = response.content[0].text
+
+    # Strip markdown code fences if Claude wraps the HTML
+    html_content = re.sub(r"^```html?\s*\n?", "", html_content)
+    html_content = re.sub(r"\n?```\s*$", "", html_content)
+
     print(f"Generated recap ({len(html_content)} chars)")
     return html_content
 
@@ -258,7 +433,7 @@ def generate_recap(articles):
 def send_email(html_content):
     """Send the recap email via SMTP (Gmail-compatible)."""
     today = datetime.now().strftime("%B %d, %Y")
-    subject = "Your AI News Recap -- Week of " + today
+    subject = "AI Recap // " + today
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -305,13 +480,16 @@ def main():
     # 2. Deduplicate
     articles = deduplicate(articles)
 
-    # 3. Generate recap with Claude
+    # 3. Enrich with OG images where missing
+    articles = enrich_with_og_images(articles)
+
+    # 4. Generate recap with Claude
     html_recap = generate_recap(articles)
 
-    # 4. Save locally (always)
+    # 5. Save locally (always)
     save_local(html_recap)
 
-    # 5. Send email (if configured)
+    # 6. Send email (if configured)
     if SMTP_USER and SMTP_PASSWORD and EMAIL_TO:
         send_email(html_recap)
     else:
