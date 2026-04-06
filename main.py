@@ -81,6 +81,15 @@ RSS_FEEDS = [
     {"name": "The Batch (Andrew Ng)", "url": "https://www.deeplearning.ai/the-batch/feed/", "category": "thought_leadership"},
     {"name": "One Useful Thing (Ethan Mollick)", "url": "https://www.oneusefulthing.org/feed", "category": "thought_leadership"},
     {"name": "Ahead of AI (Sebastian Raschka)", "url": "https://magazine.sebastianraschka.com/feed", "category": "thought_leadership"},
+
+    # -- LinkedIn / Professional AI --------------------------------------------
+    {"name": "LinkedIn Engineering Blog", "url": "https://engineering.linkedin.com/blog.rss", "category": "professional"},
+    {"name": "AI at LinkedIn", "url": "https://www.linkedin.com/blog/engineering/artificial-intelligence/rss", "category": "professional"},
+
+    # -- Research / arXiv ------------------------------------------------------
+    {"name": "arXiv CS.AI", "url": "https://rss.arxiv.org/rss/cs.AI", "category": "research"},
+    {"name": "arXiv CS.LG (ML)", "url": "https://rss.arxiv.org/rss/cs.LG", "category": "research"},
+    {"name": "arXiv CS.CL (NLP/LLMs)", "url": "https://rss.arxiv.org/rss/cs.CL", "category": "research"},
 ]
 
 
@@ -495,6 +504,36 @@ def enrich_with_og_images(articles, max_fetches=15):
 
 # -- Deduplicate ---------------------------------------------------------------
 
+def score_articles_by_coverage(articles):
+    """Score articles by how many sources covered the same topic (signal of significance)."""
+    from collections import defaultdict
+    import re as _re
+
+    # Extract key terms from title (3+ char words, no stopwords)
+    stopwords = {"the", "and", "for", "with", "this", "that", "are", "was", "has", "its", "how", "why", "what", "new", "can", "all", "from", "will", "have"}
+
+    def get_key_terms(title):
+        words = _re.findall(r'\b[a-zA-Z]{3,}\b', title.lower())
+        return {w for w in words if w not in stopwords}
+
+    # Build term frequency map
+    term_freq = defaultdict(int)
+    for a in articles:
+        for term in get_key_terms(a.get("title", "")):
+            term_freq[term] += 1
+
+    # Score each article: sum of term frequencies for its key terms
+    for a in articles:
+        terms = get_key_terms(a.get("title", ""))
+        a["coverage_score"] = sum(term_freq[t] for t in terms)
+        a["coverage_count"] = max(term_freq[t] for t in terms) if terms else 1
+
+    # Sort by coverage score descending
+    articles.sort(key=lambda x: x.get("coverage_score", 0), reverse=True)
+    print(f"Scored {len(articles)} articles by cross-source coverage")
+    return articles
+
+
 def deduplicate(articles):
     """Remove duplicate articles by URL and similar titles."""
     seen_urls = set()
@@ -552,6 +591,11 @@ SYSTEM_PROMPT = (
 
     "Close with 'Stuff I'm watching' -- 2-3 quick one-liners about next week.\n\n"
 
+    "After 'Stuff I'm watching', add a compact '🧪 Model Releases This Week' table if any model "
+    "releases, updates, or benchmarks appear in the articles. Use an HTML table with columns: "
+    "Model | Company | Key Claim | Why It Matters. Keep it to max 4 rows. If no clear model "
+    "releases, skip this section entirely.\n\n"
+
     "HARD RULES:\n"
     "- Never use em-dashes. Not one. Use commas, periods, or just start a new sentence.\n"
     "- Banned phrases: 'in a move that', 'the landscape', 'it remains to be seen', "
@@ -571,7 +615,8 @@ SYSTEM_PROMPT = (
 )
 
 USER_PROMPT_TEMPLATE = (
-    "Here are {article_count} AI news articles from this week ({date_range}).\n\n"
+    "Here are {article_count} AI news articles from this week ({date_range}), "
+    "sorted by cross-source coverage score (most-covered stories first).\n\n"
     "ARTICLES:\n{articles_json}\n\n"
     "---\n\n"
     "AI TWITTER / COMMUNITY BUZZ ({tweet_count} tweets, "
@@ -607,7 +652,7 @@ def generate_recap(articles, tweets, discourse):
     )
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-opus-4-5",
         max_tokens=8192,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
@@ -618,6 +663,26 @@ def generate_recap(articles, tweets, discourse):
     # Strip markdown code fences if Claude wraps the HTML
     html_content = re.sub(r"^```html?\s*\n?", "", html_content)
     html_content = re.sub(r"\n?```\s*$", "", html_content)
+
+    # Inject dark mode CSS so the email renders well in dark-mode clients
+    dark_mode_css = (
+        "<style>"
+        "@media (prefers-color-scheme: dark) {"
+        "body, .email-wrapper { background-color: #1a1a1a !important; color: #e8e8e8 !important; }"
+        "a { color: #7ab8f5 !important; }"
+        "h1, h2, h3, h4 { color: #ffffff !important; }"
+        ".article-card, .section-block { background-color: #2a2a2a !important; border-color: #444 !important; }"
+        "table { background-color: #2a2a2a !important; color: #e8e8e8 !important; }"
+        "th { background-color: #333 !important; color: #fff !important; }"
+        "td { border-color: #444 !important; }"
+        "}"
+        "</style>"
+    )
+    # Insert before the closing </head> tag, or prepend if no <head> present
+    if "</head>" in html_content:
+        html_content = html_content.replace("</head>", dark_mode_css + "</head>", 1)
+    else:
+        html_content = dark_mode_css + html_content
 
     # Final safety pass: replace any em-dashes that slipped through
     html_content = html_content.replace("\u2014", "--")  # em-dash
@@ -654,12 +719,77 @@ def send_email(html_content):
 
 
 def save_local(html_content):
-    """Save a local copy for preview/debugging."""
+    """Save a local copy for preview/debugging and commit archive to GitHub."""
+    # --- Local copy ---
     os.makedirs("output", exist_ok=True)
     filename = "output/recap_" + datetime.now().strftime("%Y%m%d") + ".html"
     with open(filename, "w") as f:
         f.write(html_content)
     print(f"Saved local copy: {filename}")
+
+    # --- GitHub archive ---
+    gh_token = os.getenv("GITHUB_TOKEN")
+    gh_repo = os.getenv("GITHUB_REPO")  # e.g. "rggoldberg/Ai-News-recap"
+    if not gh_token or not gh_repo:
+        print("GITHUB_TOKEN / GITHUB_REPO not set — skipping GitHub archive.")
+        return
+
+    import base64
+    import urllib.request
+    import urllib.error as urllib_error
+
+    datestamp = datetime.now().strftime("%Y%m%d")
+    archive_path = f"archive/recap_{datestamp}.html"
+    api_url = f"https://api.github.com/repos/{gh_repo}/contents/{archive_path}"
+
+    encoded = base64.b64encode(html_content.encode("utf-8")).decode("ascii")
+
+    # Check if the file already exists (need its SHA to update)
+    sha = None
+    req_get = urllib.request.Request(
+        api_url,
+        headers={
+            "Authorization": f"token {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req_get) as resp:
+            existing = json.loads(resp.read())
+            sha = existing.get("sha")
+    except urllib_error.HTTPError as e:
+        if e.code != 404:
+            print(f"GitHub archive check failed: {e}")
+            return
+
+    payload = {
+        "message": f"archive: add recap for {datestamp}",
+        "content": encoded,
+        "branch": "main",
+    }
+    if sha:
+        payload["sha"] = sha
+
+    data = json.dumps(payload).encode("utf-8")
+    req_put = urllib.request.Request(
+        api_url,
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"token {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req_put) as resp:
+            result = json.loads(resp.read())
+            html_url = result.get("content", {}).get("html_url", archive_path)
+            print(f"Archived to GitHub: {html_url}")
+    except urllib_error.HTTPError as e:
+        print(f"GitHub archive upload failed ({e.code}): {e.read().decode()}")
 
 
 # -- Main ----------------------------------------------------------------------
